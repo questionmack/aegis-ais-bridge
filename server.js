@@ -13,18 +13,22 @@ const STALL_MS = 5 * 60 * 1000        // no messages for 5 minutes = stalled
 const vessels = new Map()
 let wsConnected = false
 let ws = null
-let lastMessageAt = 0
+let lastMessageAt = 0   // time of last real message from aisstream
+let connectedAt = 0     // time the current socket opened
+let messagesTotal = 0
+let reconnects = 0
+let lastError = null
 
 function connectAIS() {
   if (wsConnected || ws) return
   const apiKey = process.env.AIS_STREAM_API_KEY
-  if (!apiKey) { console.error('[AIS] No API key set'); return }
+  if (!apiKey) { lastError = 'AIS_STREAM_API_KEY not set'; console.error('[AIS] No API key set'); return }
 
   ws = new WebSocket('wss://stream.aisstream.io/v0/stream')
 
   ws.on('open', () => {
     wsConnected = true
-    lastMessageAt = Date.now()
+    connectedAt = Date.now()
     console.log('[AIS] Connected to aisstream.io')
     ws.send(JSON.stringify({
       APIKey: apiKey,
@@ -35,8 +39,10 @@ function connectAIS() {
 
   ws.on('message', (data) => {
     lastMessageAt = Date.now()
+    messagesTotal++
     try {
       const msg = JSON.parse(data.toString())
+      if (msg.error) { lastError = 'aisstream: ' + String(msg.error).slice(0, 200); return }
       const mmsi = String(msg.MetaData?.MMSI ?? '')
       if (!mmsi) return
 
@@ -66,17 +72,22 @@ function connectAIS() {
           existing.shipType = s.Type ?? existing.shipType
         }
       }
-    } catch (e) {}
+    } catch (e) {
+      lastError = 'parse: ' + e.message
+    }
   })
 
-  ws.on('close', () => {
+  ws.on('close', (code, reason) => {
     wsConnected = false
     ws = null
-    console.log('[AIS] Disconnected, reconnecting in 10s')
+    reconnects++
+    if (reason && reason.length) lastError = 'closed ' + code + ': ' + reason.toString().slice(0, 200)
+    console.log('[AIS] Disconnected (' + code + '), reconnecting in 10s')
     setTimeout(connectAIS, 10000)
   })
 
   ws.on('error', (err) => {
+    lastError = 'socket: ' + err.message
     console.error('[AIS] Error:', err.message)
     ws?.close()
   })
@@ -90,22 +101,33 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000)
 
-// Reconnect if the stream goes quiet without closing
+// Reconnect if no message has arrived for STALL_MS since the socket opened
 setInterval(() => {
-  if (ws && wsConnected && Date.now() - lastMessageAt > STALL_MS) {
+  if (ws && wsConnected && Date.now() - Math.max(lastMessageAt, connectedAt) > STALL_MS) {
+    lastError = 'stalled: no messages for 5 min'
     console.warn('[AIS] Stream stalled, reconnecting')
     ws.terminate()
   }
 }, 60 * 1000)
 
-const isLive = () => wsConnected && Date.now() - lastMessageAt < STALL_MS
+// Live only if a real message arrived recently (a reconnect alone doesn't count)
+const isLive = () => wsConnected && lastMessageAt > 0 && Date.now() - lastMessageAt < STALL_MS
 
 app.get('/vessels', (req, res) => {
   res.json({ vessels: Array.from(vessels.values()), count: vessels.size, connected: isLive(), bbox: BBOX })
 })
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, connected: isLive(), count: vessels.size })
+  res.json({
+    ok: true,
+    connected: isLive(),
+    socketOpen: wsConnected,
+    count: vessels.size,
+    messagesTotal,
+    lastMessageAgeSec: lastMessageAt ? Math.round((Date.now() - lastMessageAt) / 1000) : null,
+    reconnects,
+    lastError,
+  })
 })
 
 const PORT = process.env.PORT || 3001
